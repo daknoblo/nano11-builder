@@ -1,0 +1,518 @@
+name: build-nano11-iso
+
+on:
+  workflow_dispatch:
+    inputs:
+      iso_url:
+        description: "Direkte URL zur offiziellen Windows 11 ISO (optional, wenn iso_path genutzt wird)"
+        required: false
+        default: ""
+      iso_path:
+        description: "Pfad zu bereits bereitgestellter ISO auf dem Runner (optional)"
+        required: false
+        default: ""
+      image_index:
+        description: "Windows-Image-Index aus install.wim/esd"
+        required: true
+        default: "1"
+      output_dir:
+        description: "Ausgabeordner auf dem Runner"
+        required: true
+        default: "C:\\nano11-output"
+      nano11_script_path:
+        description: "Pfad zum nano11builder.ps1 im Repository"
+        required: true
+        default: "nano11builder.ps1"
+      nano11_script_url:
+        description: "Fallback-URL für nano11builder.ps1, falls lokal nicht vorhanden"
+        required: false
+        default: "https://raw.githubusercontent.com/ntdevlabs/nano11/main/nano11builder.ps1"
+      install_adk:
+        description: "ADK Deployment Tools Installation erzwingen"
+        required: true
+        type: choice
+        options:
+          - auto
+          - always
+          - never
+        default: auto
+      publish_target:
+        description: "Wohin die fertige ISO veröffentlicht werden soll"
+        required: true
+        type: choice
+        options:
+          - artifact
+          - azure-storage
+          - both
+        default: artifact
+      artifact_name:
+        description: "Name des GitHub-Artefakts"
+        required: true
+        default: "nano11-iso"
+      artifact_retention_days:
+        description: "Retention-Tage für das GitHub-Artefakt"
+        required: true
+        default: "7"
+      azure_storage_account:
+        description: "Azure Storage Account Name (nur bei azure-storage/both)"
+        required: false
+        default: ""
+      azure_storage_container:
+        description: "Azure Blob Container (nur bei azure-storage/both)"
+        required: false
+        default: ""
+      azure_blob_prefix:
+        description: "Optionaler Blob-Prefix (Ordner)"
+        required: false
+        default: "nano11"
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  build:
+    name: Build Nano11 ISO
+    runs-on: windows-2022
+    timeout-minutes: 480
+
+    env:
+      BUILD_ROOT: C:\\nano11-ci
+      ISO_DOWNLOAD_PATH: C:\\nano11-ci\\input\\windows11.iso
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate admin privileges and initialize logging
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+
+          function Write-Log {
+            param([string]$Message)
+            $stamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+            Write-Host "[$stamp] $Message"
+          }
+
+          $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+          Write-Log "Runner user: $env:USERNAME"
+          Write-Log "Administrative token present: $isAdmin"
+          if (-not $isAdmin) {
+            throw "Dieser Build benötigt Administratorrechte auf dem Windows-Runner."
+          }
+
+          New-Item -Path "$env:BUILD_ROOT\\input" -ItemType Directory -Force | Out-Null
+          New-Item -Path "$env:BUILD_ROOT\\logs" -ItemType Directory -Force | Out-Null
+          New-Item -Path "${{ inputs.output_dir }}" -ItemType Directory -Force | Out-Null
+
+          "NANO11_LOG=$env:BUILD_ROOT\\logs\\nano11-build.log" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "ISO_OUTPUT_DIR=${{ inputs.output_dir }}" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          Write-Log "Initialisierung abgeschlossen."
+
+      - name: Resolve ISO source and download or use provided ISO
+        id: iso_source
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+
+          function Write-Log {
+            param([string]$Message)
+            $stamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+            Write-Host "[$stamp] $Message"
+          }
+
+          $isoUrl = "${{ inputs.iso_url }}".Trim()
+          $isoPathInput = "${{ inputs.iso_path }}".Trim()
+
+          if ([string]::IsNullOrWhiteSpace($isoUrl) -and [string]::IsNullOrWhiteSpace($isoPathInput)) {
+            throw "Es muss entweder 'iso_url' oder 'iso_path' gesetzt sein."
+          }
+
+          if (-not [string]::IsNullOrWhiteSpace($isoUrl) -and -not [string]::IsNullOrWhiteSpace($isoPathInput)) {
+            throw "Bitte nur eine ISO-Quelle setzen: entweder 'iso_url' oder 'iso_path'."
+          }
+
+          if (-not [string]::IsNullOrWhiteSpace($isoUrl)) {
+            Write-Log "Lade ISO von URL: $isoUrl"
+            $target = $env:ISO_DOWNLOAD_PATH
+            $maxAttempts = 3
+            $attempt = 0
+            while ($true) {
+              $attempt++
+              try {
+                Write-Log "Download-Versuch $attempt von $maxAttempts"
+                Invoke-WebRequest -Uri $isoUrl -OutFile $target -MaximumRedirection 10
+                break
+              }
+              catch {
+                if ($attempt -ge $maxAttempts) {
+                  throw
+                }
+                Start-Sleep -Seconds (5 * $attempt)
+              }
+            }
+
+            if (-not (Test-Path $target)) {
+              throw "ISO-Download fehlgeschlagen: $target wurde nicht erstellt."
+            }
+
+            $resolvedIso = (Resolve-Path $target).Path
+            Write-Log "ISO erfolgreich heruntergeladen: $resolvedIso"
+          }
+          else {
+            if (-not (Test-Path $isoPathInput)) {
+              throw "Angegebene ISO-Datei nicht gefunden: $isoPathInput"
+            }
+            $resolvedIso = (Resolve-Path $isoPathInput).Path
+            Write-Log "Verwende bereitgestellte ISO: $resolvedIso"
+          }
+
+          "iso_path=$resolvedIso" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Mount ISO and validate install image
+        id: mount_iso
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+
+          function Write-Log {
+            param([string]$Message)
+            $stamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+            Write-Host "[$stamp] $Message"
+          }
+
+          $isoPath = "${{ steps.iso_source.outputs.iso_path }}"
+          Write-Log "Mounting ISO: $isoPath"
+
+          $mounted = Mount-DiskImage -ImagePath $isoPath -PassThru
+          $volume = $mounted | Get-Volume
+          if (-not $volume -or -not $volume.DriveLetter) {
+            throw "Mounted ISO hat keinen ermittelbaren Laufwerksbuchstaben."
+          }
+
+          $driveLetter = "$($volume.DriveLetter):"
+          Write-Log "ISO gemountet unter: $driveLetter"
+
+          $installWim = Join-Path $driveLetter "sources\\install.wim"
+          $installEsd = Join-Path $driveLetter "sources\\install.esd"
+          if (-not (Test-Path $installWim) -and -not (Test-Path $installEsd)) {
+            throw "Weder install.wim noch install.esd in der ISO gefunden."
+          }
+
+          if (Test-Path $installWim) {
+            Write-Log "Gefunden: $installWim"
+          }
+          if (Test-Path $installEsd) {
+            Write-Log "Gefunden: $installEsd"
+          }
+
+          "iso_drive=$driveLetter" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Extract install.wim from mounted ISO
+        id: extract_wim
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+
+          function Write-Log {
+            param([string]$Message)
+            $stamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+            Write-Host "[$stamp] $Message"
+          }
+
+          $driveLetter = "${{ steps.mount_iso.outputs.iso_drive }}"
+          $extractDir = Join-Path $env:BUILD_ROOT "extracted"
+          New-Item -Path $extractDir -ItemType Directory -Force | Out-Null
+
+          $sourceWim = Join-Path $driveLetter "sources\\install.wim"
+          $sourceEsd = Join-Path $driveLetter "sources\\install.esd"
+          $targetWim = Join-Path $extractDir "install.wim"
+
+          if (Test-Path $sourceWim) {
+            Write-Log "Extrahiere install.wim via Copy-Item nach $targetWim"
+            Copy-Item -Path $sourceWim -Destination $targetWim -Force
+          }
+          elseif (Test-Path $sourceEsd) {
+            Write-Log "install.wim fehlt, konvertiere install.esd -> install.wim (Index ${{ inputs.image_index }})"
+            & dism /English /Export-Image "/SourceImageFile:$sourceEsd" "/SourceIndex:${{ inputs.image_index }}" "/DestinationImageFile:$targetWim" /Compress:max /CheckIntegrity
+          }
+          else {
+            throw "Weder install.wim noch install.esd verfügbar."
+          }
+
+          if (-not (Test-Path $targetWim)) {
+            throw "Extraktion fehlgeschlagen, install.wim nicht gefunden: $targetWim"
+          }
+
+          Write-Log "install.wim erfolgreich extrahiert: $targetWim"
+          "extracted_wim=$targetWim" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Ensure nano11 builder script exists
+        id: nano11_script
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+
+          function Write-Log {
+            param([string]$Message)
+            $stamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+            Write-Host "[$stamp] $Message"
+          }
+
+          $scriptPathInput = "${{ inputs.nano11_script_path }}"
+          $repoScriptPath = Join-Path $env:GITHUB_WORKSPACE $scriptPathInput
+
+          if (Test-Path $repoScriptPath) {
+            $scriptPath = (Resolve-Path $repoScriptPath).Path
+            Write-Log "Nano11-Skript gefunden: $scriptPath"
+          }
+          else {
+            $url = "${{ inputs.nano11_script_url }}".Trim()
+            if ([string]::IsNullOrWhiteSpace($url)) {
+              throw "nano11-Skript nicht gefunden und keine nano11_script_url angegeben."
+            }
+
+            $downloadDir = Join-Path $env:BUILD_ROOT "tools"
+            New-Item -Path $downloadDir -ItemType Directory -Force | Out-Null
+            $scriptPath = Join-Path $downloadDir "nano11builder.ps1"
+
+            Write-Log "Nano11-Skript lokal nicht vorhanden. Lade von: $url"
+            Invoke-WebRequest -Uri $url -OutFile $scriptPath
+            Write-Log "Nano11-Skript heruntergeladen: $scriptPath"
+          }
+
+          "script_path=$scriptPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Ensure oscdimg.exe is available (ADK or preinstalled)
+        id: oscdimg
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+
+          function Write-Log {
+            param([string]$Message)
+            $stamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+            Write-Host "[$stamp] $Message"
+          }
+
+          $scriptPath = "${{ steps.nano11_script.outputs.script_path }}"
+          $scriptDir = Split-Path -Path $scriptPath -Parent
+          $targetOscdimg = Join-Path $scriptDir "oscdimg.exe"
+          $mode = "${{ inputs.install_adk }}"
+
+          function Find-Oscdimg {
+            $candidates = @(
+              "${env:ProgramFiles(x86)}\\Windows Kits\\10\\Assessment and Deployment Kit\\Deployment Tools\\amd64\\Oscdimg\\oscdimg.exe",
+              "${env:ProgramFiles(x86)}\\Windows Kits\\10\\Assessment and Deployment Kit\\Deployment Tools\\x86\\Oscdimg\\oscdimg.exe",
+              "$env:ProgramFiles\\Windows Kits\\10\\Assessment and Deployment Kit\\Deployment Tools\\amd64\\Oscdimg\\oscdimg.exe"
+            )
+
+            foreach ($candidate in $candidates) {
+              if (Test-Path $candidate) {
+                return (Resolve-Path $candidate).Path
+              }
+            }
+
+            $cmd = Get-Command oscdimg.exe -ErrorAction SilentlyContinue
+            if ($cmd) {
+              return $cmd.Source
+            }
+
+            return $null
+          }
+
+          $foundOscdimg = Find-Oscdimg
+          if (($mode -eq 'always') -or (-not $foundOscdimg -and $mode -ne 'never')) {
+            Write-Log "oscdimg.exe nicht gefunden. Installiere ADK Deployment Tools (silent)."
+            $adkSetup = Join-Path $env:BUILD_ROOT "tools\\adksetup.exe"
+            New-Item -Path (Split-Path $adkSetup -Parent) -ItemType Directory -Force | Out-Null
+
+            $adkUrl = "https://go.microsoft.com/fwlink/?linkid=2289980"
+            Invoke-WebRequest -Uri $adkUrl -OutFile $adkSetup
+
+            $arguments = @(
+              '/quiet',
+              '/norestart',
+              '/ceip',
+              'off',
+              '/features',
+              'OptionId.DeploymentTools'
+            )
+
+            $proc = Start-Process -FilePath $adkSetup -ArgumentList $arguments -PassThru -Wait
+            if ($proc.ExitCode -ne 0) {
+              throw "ADK Installation fehlgeschlagen (ExitCode=$($proc.ExitCode))."
+            }
+
+            $foundOscdimg = Find-Oscdimg
+          }
+
+          if (-not $foundOscdimg) {
+            throw "oscdimg.exe nicht gefunden. Setze install_adk auf auto/always oder stelle oscdimg.exe bereit."
+          }
+
+          Copy-Item -Path $foundOscdimg -Destination $targetOscdimg -Force
+          Write-Log "oscdimg.exe bereitgestellt unter: $targetOscdimg"
+
+          "oscdimg_path=$targetOscdimg" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Run nano11 builder (non-interactive CI wrapper)
+        id: nano11_build
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+
+          & "$env:GITHUB_WORKSPACE\\scripts\\Invoke-Nano11CiBuild.ps1" `
+            -Nano11ScriptPath "${{ steps.nano11_script.outputs.script_path }}" `
+            -MountedIsoDrive "${{ steps.mount_iso.outputs.iso_drive }}" `
+            -ImageIndex "${{ inputs.image_index }}" `
+            -OutputDir "${{ env.ISO_OUTPUT_DIR }}" `
+            -LogPath "${{ env.NANO11_LOG }}"
+
+          $latestIso = Get-ChildItem -Path "${{ env.ISO_OUTPUT_DIR }}" -Filter "*.iso" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $latestIso) {
+            throw "Keine ISO im Output-Verzeichnis gefunden: ${{ env.ISO_OUTPUT_DIR }}"
+          }
+
+          "iso_path=$($latestIso.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Generate checksums and metadata
+        id: metadata
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+
+          function Write-Log {
+            param([string]$Message)
+            $stamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+            Write-Host "[$stamp] $Message"
+          }
+
+          $isoPath = "${{ steps.nano11_build.outputs.iso_path }}"
+          if (-not (Test-Path $isoPath)) {
+            throw "ISO für Metadaten nicht gefunden: $isoPath"
+          }
+
+          $file = Get-Item $isoPath
+          $sha = Get-FileHash -Path $isoPath -Algorithm SHA256
+          $meta = [ordered]@{
+            isoName = $file.Name
+            isoPath = $file.FullName
+            sizeBytes = $file.Length
+            sha256 = $sha.Hash
+            builtAtUtc = (Get-Date).ToUniversalTime().ToString('o')
+            imageIndex = "${{ inputs.image_index }}"
+            sourceIso = "${{ steps.iso_source.outputs.iso_path }}"
+            publishTarget = "${{ inputs.publish_target }}"
+          }
+
+          $metaPath = Join-Path "${{ env.ISO_OUTPUT_DIR }}" "nano11-metadata.json"
+          $meta | ConvertTo-Json -Depth 5 | Out-File -FilePath $metaPath -Encoding utf8
+
+          Write-Log "ISO erstellt: $($file.FullName)"
+          Write-Log "ISO Größe: $($file.Length) Bytes"
+          Write-Log "ISO SHA256: $($sha.Hash)"
+          Write-Log "Metadaten: $metaPath"
+
+          "metadata_path=$metaPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Upload ISO as GitHub artifact
+        if: ${{ inputs.publish_target == 'artifact' || inputs.publish_target == 'both' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: |
+            ${{ steps.nano11_build.outputs.iso_path }}
+            ${{ steps.metadata.outputs.metadata_path }}
+            ${{ env.NANO11_LOG }}
+          if-no-files-found: error
+          retention-days: ${{ inputs.artifact_retention_days }}
+
+      - name: Azure login for storage upload
+        if: ${{ inputs.publish_target == 'azure-storage' || inputs.publish_target == 'both' }}
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Upload ISO to Azure Storage Account
+        if: ${{ inputs.publish_target == 'azure-storage' || inputs.publish_target == 'both' }}
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+
+          function Write-Log {
+            param([string]$Message)
+            $stamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+            Write-Host "[$stamp] $Message"
+          }
+
+          $account = "${{ inputs.azure_storage_account }}".Trim()
+          $container = "${{ inputs.azure_storage_container }}".Trim()
+          $prefix = "${{ inputs.azure_blob_prefix }}".Trim()
+
+          if ([string]::IsNullOrWhiteSpace($account) -or [string]::IsNullOrWhiteSpace($container)) {
+            throw "Für Azure-Upload müssen azure_storage_account und azure_storage_container gesetzt sein."
+          }
+
+          $isoPath = "${{ steps.nano11_build.outputs.iso_path }}"
+          $isoName = Split-Path $isoPath -Leaf
+          $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+          $blobName = if ([string]::IsNullOrWhiteSpace($prefix)) { "$stamp-$isoName" } else { "$prefix/$stamp-$isoName" }
+
+          Write-Log "Upload nach Azure Blob Storage startet."
+          Write-Log "Storage Account: $account"
+          Write-Log "Container: $container"
+          Write-Log "Blob Name: $blobName"
+
+          az storage blob upload `
+            --auth-mode login `
+            --account-name $account `
+            --container-name $container `
+            --name $blobName `
+            --file $isoPath `
+            --overwrite true
+
+          $blobUrl = "https://$account.blob.core.windows.net/$container/$blobName"
+          Write-Log "ISO erfolgreich in Azure Storage hochgeladen: $blobUrl"
+
+      - name: Unmount ISO (always)
+        if: always()
+        shell: pwsh
+        run: |
+          $isoPath = "${{ steps.iso_source.outputs.iso_path }}"
+          if ([string]::IsNullOrWhiteSpace($isoPath)) {
+            Write-Host "[cleanup] Kein ISO-Pfad vorhanden, überspringe unmount."
+            exit 0
+          }
+
+          try {
+            Dismount-DiskImage -ImagePath $isoPath -ErrorAction Stop
+            Write-Host "[cleanup] ISO unmounted: $isoPath"
+          }
+          catch {
+            Write-Host "[cleanup] ISO unmount konnte nicht abgeschlossen werden: $($_.Exception.Message)"
+          }
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nano11-debug-logs
+          path: |
+            ${{ env.NANO11_LOG }}
+            C:\\nano11-ci\\logs\\*
+          if-no-files-found: warn
+          retention-days: 7
